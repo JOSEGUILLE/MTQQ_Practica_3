@@ -97,10 +97,16 @@
 #define MQTT_CONNECTED_EVT		( 1 << 0 )
 #define MQTT_SENSOR_EVT			( 1 << 1 )
 #define MQTT_SPRINKLERS_EVT		( 1 << 2 )
-#define MQTT_DISCONNECTED_EVT	( 1 << 3 )
+#define MQTT_HLIGHTS_EVT		( 1 << 3 )
+#define MQTT_DISCONNECTED_EVT	( 1 << 4 )
 
+/* LED ROJO*/
 #define BOARD_LED_GPIO BOARD_LED_RED_GPIO
 #define BOARD_LED_GPIO_PIN BOARD_LED_RED_GPIO_PIN
+
+/* LED AZUL*/
+#define BOARD_LED_B_GPIO BOARD_LED_BLUE_GPIO
+#define BOARD_LED_B_GPIO_PIN BOARD_LED_BLUE_GPIO_PIN
 
 /*******************************************************************************
  * Prototypes
@@ -150,6 +156,8 @@ TimerHandle_t xTimerSensor;
 uint32_t humidity_sensor = 50;
 uint32_t samples_cnt = 0;
 bool sprinklers_on;
+
+bool houselights_on;
 
 
 /*******************************************************************************
@@ -205,13 +213,21 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
         }
     }
 
-    if(!memcmp(data, "On", 2)) {
+    if(!memcmp(data, "on", 2)) {
     	sprinklers_on = true;
     	xEventGroupSetBits(xEventGroup,	MQTT_SPRINKLERS_EVT);
     }
-    else if(!memcmp(data, "Off", 3)) {
+    else if(!memcmp(data, "off", 3)) {
     	sprinklers_on = false;
     	xEventGroupSetBits(xEventGroup,	MQTT_SPRINKLERS_EVT);
+    }
+    if(!memcmp(data, "lighton", 7)) {
+    	houselights_on = true;
+    	xEventGroupSetBits(xEventGroup,	MQTT_HLIGHTS_EVT);
+    }
+    else if(!memcmp(data, "lightoff", 8)) {
+    	houselights_on = false;
+    	xEventGroupSetBits(xEventGroup,	MQTT_HLIGHTS_EVT);
     }
 
     if (flags & MQTT_DATA_FLAG_LAST)
@@ -247,6 +263,31 @@ static void mqtt_subscribe_topics(mqtt_client_t *client)
         }
     }
 }
+static void mqtt_subscribe_topics2(mqtt_client_t *client)
+{
+    static const char *topics[] = {"/hlights"};
+    int qos[]                   = {0};
+    err_t err;
+    int i;
+
+    mqtt_set_inpub_callback(client, mqtt_incoming_publish_cb, mqtt_incoming_data_cb,
+                            LWIP_CONST_CAST(void *, &mqtt_client_info));
+
+    for (i = 0; i < ARRAY_SIZE(topics); i++)
+    {
+        err = mqtt_subscribe(client, topics[i], qos[i], mqtt_topic_subscribed_cb, LWIP_CONST_CAST(void *, topics[i]));
+
+        if (err == ERR_OK)
+        {
+            PRINTF("Subscribing to the topic \"%s\" with QoS %d...\r\n", topics[i], qos[i]);
+        }
+        else
+        {
+            PRINTF("Failed to subscribe to the topic \"%s\" with QoS %d: %d.\r\n", topics[i], qos[i], err);
+        }
+    }
+}
+
 
 /*!
  * @brief Called when connection state changes.
@@ -262,6 +303,7 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
         case MQTT_CONNECT_ACCEPTED:
             PRINTF("MQTT client \"%s\" connected.\r\n", client_info->client_id);
             mqtt_subscribe_topics(client);
+            mqtt_subscribe_topics2(client);
             xEventGroupSetBits(xEventGroup,	MQTT_CONNECTED_EVT);
             break;
 
@@ -374,6 +416,7 @@ static void app_thread(void *arg)
 
     /* Init output LED GPIO. */
     GPIO_PinInit(BOARD_LED_GPIO, BOARD_LED_GPIO_PIN, &led_config);
+    GPIO_PinInit(BOARD_LED_B_GPIO, BOARD_LED_B_GPIO_PIN, &led_config);
 
     /* Wait for address from DHCP */
     PRINTF("Getting IP address from DHCP...\r\n");
@@ -433,7 +476,7 @@ static void app_thread(void *arg)
 		// the event group.  Clear the bits before exiting.
 		uxBits = xEventGroupWaitBits(
 					xEventGroup,	// The event group being tested.
-					MQTT_CONNECTED_EVT | MQTT_SENSOR_EVT | MQTT_SPRINKLERS_EVT | MQTT_DISCONNECTED_EVT,	// The bits within the event group to wait for.
+					MQTT_CONNECTED_EVT | MQTT_SENSOR_EVT | MQTT_SPRINKLERS_EVT | MQTT_HLIGHTS_EVT | MQTT_DISCONNECTED_EVT,	// The bits within the event group to wait for.
 					pdTRUE,			// BIT_0 and BIT_4 should be cleared before returning.
 					pdFALSE,		// Don't wait for both bits, either bit will do.
 					xTicksToWait );	// Wait a maximum of 100ms for either bit to be set.
@@ -467,6 +510,21 @@ static void app_thread(void *arg)
 				GPIO_PortSet(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
 			}
 		}
+		else if(uxBits & MQTT_HLIGHTS_EVT )
+		{
+			PRINTF("MQTT_HLIGHTS_EVT.\r\n");
+			if(houselights_on)
+			{
+				LED_BLUE_ON();
+				LED_RED_OFF();
+			}
+			else
+			{
+				LED_BLUE_OFF();
+			}
+		}
+
+
 		else if(uxBits & MQTT_DISCONNECTED_EVT ) {
 			PRINTF("MQTT_DISCONNECTED_EVT.\r\n");
 		}
