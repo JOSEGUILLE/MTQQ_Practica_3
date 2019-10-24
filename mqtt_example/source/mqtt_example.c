@@ -28,10 +28,11 @@
 #include "ctype.h"
 
 #include "board.h"
-
-#include "fsl_device_registers.h"
 #include "pin_mux.h"
 #include "clock_config.h"
+
+#include "fsl_device_registers.h"
+
 
 #include "event_groups.h"
 #include "stdlib.h"
@@ -97,8 +98,10 @@
 #define MQTT_CONNECTED_EVT		( 1 << 0 )
 #define MQTT_SENSOR_EVT			( 1 << 1 )
 #define MQTT_SPRINKLERS_EVT		( 1 << 2 )
-#define MQTT_HLIGHTS_EVT		( 1 << 3 )
-#define MQTT_DISCONNECTED_EVT	( 1 << 4 )
+#define MQTT_PKVISITED_EVT		( 1 << 3 )
+#define MQTT_PKPLACES_EVT		( 1 << 4 )
+#define MQTT_HLIGHTS_EVT		( 1 << 5 )
+#define MQTT_DISCONNECTED_EVT	( 1 << 6 )
 
 /* LED ROJO*/
 #define BOARD_LED_GPIO BOARD_LED_RED_GPIO
@@ -118,7 +121,7 @@ static int32_t get_simulated_sensor(int32_t current_value, int32_t max_step,
 							 bool increase);
 static void sensor_timer_callback(TimerHandle_t pxTimer);
 static void publish_humidity(void *ctx);
-
+static void publish_parking(void *ctx);
 
 /*******************************************************************************
  * Variables
@@ -158,6 +161,8 @@ uint32_t samples_cnt = 0;
 bool sprinklers_on;
 
 bool houselights_on;
+bool visited_on;
+uint8_t parking_places;
 
 
 /*******************************************************************************
@@ -229,6 +234,14 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
     	houselights_on = false;
     	xEventGroupSetBits(xEventGroup,	MQTT_HLIGHTS_EVT);
     }
+    if(!memcmp(data, "coming", 6)) {
+    	visited_on = true;
+    	xEventGroupSetBits(xEventGroup,	MQTT_PKVISITED_EVT);
+    }
+    else if(!memcmp(data, "leaving", 7)) {
+    	visited_on = false;
+    	xEventGroupSetBits(xEventGroup,	MQTT_PKVISITED_EVT);
+    }
 
     if (flags & MQTT_DATA_FLAG_LAST)
     {
@@ -236,12 +249,15 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
     }
 }
 
+
 /*!
  * @brief Subscribe to MQTT topics.
  */
 static void mqtt_subscribe_topics(mqtt_client_t *client)
 {
     static const char *topics[] = {"/sprinkler"};
+
+
     int qos[]                   = {0};
     err_t err;
     int i;
@@ -287,7 +303,30 @@ static void mqtt_subscribe_topics2(mqtt_client_t *client)
         }
     }
 }
+static void mqtt_subscribe_topics3(mqtt_client_t *client)
+{
+    static const char *topics[] = {"/visited"};
+    int qos[]                   = {0};
+    err_t err;
+    int i;
 
+    mqtt_set_inpub_callback(client, mqtt_incoming_publish_cb, mqtt_incoming_data_cb,
+                            LWIP_CONST_CAST(void *, &mqtt_client_info));
+
+    for (i = 0; i < ARRAY_SIZE(topics); i++)
+    {
+        err = mqtt_subscribe(client, topics[i], qos[i], mqtt_topic_subscribed_cb, LWIP_CONST_CAST(void *, topics[i]));
+
+        if (err == ERR_OK)
+        {
+            PRINTF("Subscribing to the topic \"%s\" with QoS %d...\r\n", topics[i], qos[i]);
+        }
+        else
+        {
+            PRINTF("Failed to subscribe to the topic \"%s\" with QoS %d: %d.\r\n", topics[i], qos[i], err);
+        }
+    }
+}
 
 /*!
  * @brief Called when connection state changes.
@@ -304,6 +343,7 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
             PRINTF("MQTT client \"%s\" connected.\r\n", client_info->client_id);
             mqtt_subscribe_topics(client);
             mqtt_subscribe_topics2(client);
+            mqtt_subscribe_topics3(client);
             xEventGroupSetBits(xEventGroup,	MQTT_CONNECTED_EVT);
             break;
 
@@ -384,6 +424,21 @@ static void publish_humidity(void *ctx)
 
     mqtt_publish(mqtt_client, topic, message, strlen(message), 1, 0, mqtt_message_published_cb, (void *)topic);
 }
+static void publish_parking(void *ctx)
+{
+    static const char *topic   = "/available";
+    static char message[16];
+
+    LWIP_UNUSED_ARG(ctx);
+
+    memset(message, 0, 16);
+    sprintf(message, "%d", parking_places);
+
+    PRINTF("Going to publish to the topic \"%s\"...\r\n", topic);
+
+    mqtt_publish(mqtt_client, topic, message, strlen(message), 1, 0, mqtt_message_published_cb, (void *)topic);
+}
+
 
 /*!
  * @brief Application thread.
@@ -395,7 +450,9 @@ static void app_thread(void *arg)
     err_t err;
     const TickType_t xTicksToWait = 1000 / portTICK_PERIOD_MS;
     EventBits_t uxBits;
+    uint8_t Slot = 10;
     uint32_t timerId = 0;
+
     /* Define the init structure for the output LED pin*/
     gpio_pin_config_t led_config = {
         kGPIO_DigitalOutput,
@@ -417,6 +474,7 @@ static void app_thread(void *arg)
     /* Init output LED GPIO. */
     GPIO_PinInit(BOARD_LED_GPIO, BOARD_LED_GPIO_PIN, &led_config);
     GPIO_PinInit(BOARD_LED_B_GPIO, BOARD_LED_B_GPIO_PIN, &led_config);
+
 
     /* Wait for address from DHCP */
     PRINTF("Getting IP address from DHCP...\r\n");
@@ -471,29 +529,34 @@ static void app_thread(void *arg)
         PRINTF("Failed to obtain IP address: %d.\r\n", err);
     }
 
-    while(1) {
+    while(1)
+    {
 		// Wait a maximum of 1s for either bit 0 or bit 4 to be set within
 		// the event group.  Clear the bits before exiting.
 		uxBits = xEventGroupWaitBits(
 					xEventGroup,	// The event group being tested.
-					MQTT_CONNECTED_EVT | MQTT_SENSOR_EVT | MQTT_SPRINKLERS_EVT | MQTT_HLIGHTS_EVT | MQTT_DISCONNECTED_EVT,	// The bits within the event group to wait for.
+					MQTT_CONNECTED_EVT | MQTT_SENSOR_EVT | MQTT_SPRINKLERS_EVT | MQTT_PKVISITED_EVT | MQTT_PKPLACES_EVT | MQTT_HLIGHTS_EVT | MQTT_DISCONNECTED_EVT,	// The bits within the event group to wait for.
 					pdTRUE,			// BIT_0 and BIT_4 should be cleared before returning.
 					pdFALSE,		// Don't wait for both bits, either bit will do.
 					xTicksToWait );	// Wait a maximum of 100ms for either bit to be set.
 
 		if(uxBits == 0) continue;
 
-		if(uxBits & MQTT_CONNECTED_EVT ) {
+		if(uxBits & MQTT_CONNECTED_EVT )
+		{
 			PRINTF("MQTT_CONNECTED_EVT.\r\n");
 			//Start the sensor timer
 			xTimerStart(xTimerSensor, 0);
+			LED_BLUE_OFF();
 		}
-		else if(uxBits & MQTT_SENSOR_EVT ) {
+		else if(uxBits & MQTT_SENSOR_EVT )
+		{
 			//PRINTF("MQTT_SENSOR_EVT.\r\n");
 			// Simulate the humidity %, in steps of 5, range is 10% to 100%.
 			// If the sprinkler is On, the humidity will tent to rise.
 			humidity_sensor = get_simulated_sensor(humidity_sensor, 2, 10, 100, sprinklers_on);
-			if((samples_cnt++%10) == 9){
+			if((samples_cnt++%10) == 9)
+			{
 				err = tcpip_callback(publish_humidity, NULL);
 				if (err != ERR_OK)
 				{
@@ -501,14 +564,46 @@ static void app_thread(void *arg)
 				}
 			}
 		}
-		else if(uxBits & MQTT_SPRINKLERS_EVT ) {
+		else if(uxBits & MQTT_SPRINKLERS_EVT )
+		{
 			PRINTF("MQTT_SPRINKLERS_EVT.\r\n");
-			if(sprinklers_on){
+			if(sprinklers_on)
+			{
 				GPIO_PortClear(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
+
 			}
-			else {
+			else
+			{
 				GPIO_PortSet(BOARD_LED_GPIO, 1u << BOARD_LED_GPIO_PIN);
+
 			}
+		}
+		else if(uxBits & MQTT_PKVISITED_EVT )
+		{
+			PRINTF("MQTT_PKVISITED_EVT.\r\n");
+
+			if(visited_on)
+			{
+				if(Slot > 0)
+				{
+				Slot--;
+				LED_RED_TOGGLE();
+				}
+			}
+			else
+			{
+				if(Slot < 10)
+				{
+				Slot++;
+				LED_RED_TOGGLE();
+				}
+			}
+		}
+		else if(uxBits & MQTT_PKPLACES_EVT )
+		{
+			PRINTF("MQTT_PKPLACES_EVT.\r\n");
+			parking_places = Slot;
+			err = tcpip_callback(publish_parking, NULL);
 		}
 		else if(uxBits & MQTT_HLIGHTS_EVT )
 		{
@@ -523,9 +618,8 @@ static void app_thread(void *arg)
 				LED_BLUE_OFF();
 			}
 		}
-
-
-		else if(uxBits & MQTT_DISCONNECTED_EVT ) {
+		else if(uxBits & MQTT_DISCONNECTED_EVT )
+		{
 			PRINTF("MQTT_DISCONNECTED_EVT.\r\n");
 		}
 		else
@@ -625,7 +719,7 @@ int32_t get_simulated_sensor(int32_t current_value, int32_t max_step, int32_t mi
 
 void sensor_timer_callback( TimerHandle_t pxTimer )
 {
-	xEventGroupSetBits(xEventGroup,	MQTT_SENSOR_EVT);
+	xEventGroupSetBits(xEventGroup,	MQTT_PKPLACES_EVT);
 }
 
 #endif
